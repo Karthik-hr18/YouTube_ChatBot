@@ -15,9 +15,6 @@ VIDEO_ID = "RE2c_eH0Sq4"
 
 load_dotenv(BASE_DIR / ".env")
 
-if not os.getenv("GEMINI_API_KEY"):
-    raise ValueError("GEMINI_API_KEY is missing from your .env file")
-
 
 def format_timestamp(seconds):
     seconds = int(seconds)
@@ -48,11 +45,40 @@ def get_transcript(video_id):
         raise RuntimeError(f"Could not fetch transcript: {error}") from error
 
 
-def main():
-    transcript = get_transcript(VIDEO_ID)
+def get_vector_store():
+    if not os.getenv("GEMINI_API_KEY"):
+        raise ValueError("GEMINI_API_KEY is missing from your .env file")
+
+    embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
+    return Chroma(
+        embedding_function=embeddings,
+        persist_directory=str(DATABASE_DIR),
+        collection_name=COLLECTION_NAME,
+    )
+
+
+def ingest_video(video_id):
+    """Fetch and index a video's transcript unless it is already indexed."""
+    if not video_id or not video_id.strip():
+        raise ValueError("video_id must not be empty")
+
+    vector_store = get_vector_store()
+    existing_video = vector_store.get(
+        where={"video_id": video_id},
+        include=["metadatas"],
+    )
+    if existing_video["ids"]:
+        return {
+            "video_id": video_id,
+            "indexed": False,
+            "message": "Video is already indexed.",
+            "chunk_count": len(existing_video["ids"]),
+        }
+
+    transcript = get_transcript(video_id)
     metadata = {
-        "video_id": VIDEO_ID,
-        "source": f"https://www.youtube.com/watch?v={VIDEO_ID}",
+        "video_id": video_id,
+        "source": f"https://www.youtube.com/watch?v={video_id}",
         "language": "en",
     }
 
@@ -62,30 +88,21 @@ def main():
     )
     chunks = splitter.create_documents([transcript], metadatas=[metadata])
 
-    embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
-    vector_store = Chroma(
-        embedding_function=embeddings,
-        persist_directory=str(DATABASE_DIR),
-        collection_name=COLLECTION_NAME,
-    )
+    chunk_ids = [f"{video_id}_chunk_{index}" for index in range(len(chunks))]
+    vector_store.add_documents(documents=chunks, ids=chunk_ids)
 
-    chunk_ids = [f"{VIDEO_ID}_chunk_{index}" for index in range(len(chunks))]
-    existing_ids = set(vector_store.get(ids=chunk_ids)["ids"])
-    new_chunks = []
-    new_ids = []
+    return {
+        "video_id": video_id,
+        "indexed": True,
+        "message": "Transcript indexed successfully.",
+        "chunk_count": len(chunks),
+    }
 
-    for chunk, chunk_id in zip(chunks, chunk_ids):
-        if chunk_id not in existing_ids:
-            new_chunks.append(chunk)
-            new_ids.append(chunk_id)
 
-    if new_chunks:
-        vector_store.add_documents(documents=new_chunks, ids=new_ids)
-        print(f"Added {len(new_chunks)} new chunks.")
-    else:
-        print("All chunks already exist. Nothing added.")
-
-    print("Total records in collection:", vector_store._collection.count())
+def main():
+    result = ingest_video(VIDEO_ID)
+    print(result["message"])
+    print(f"Chunks: {result['chunk_count']}")
 
 
 if __name__ == "__main__":

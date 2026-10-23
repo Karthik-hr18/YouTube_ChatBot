@@ -16,24 +16,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATABASE_DIR = BASE_DIR / "database"
 COLLECTION_NAME = "youtube_transcripts_timestamped"
 
-load_dotenv(BASE_DIR / ".env")
-
-if not os.getenv("GEMINI_API_KEY"):
-    raise ValueError("GEMINI_API_KEY is missing from your .env file")
-
-embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
-vector_store = Chroma(
-    embedding_function=embeddings,
-    persist_directory=str(DATABASE_DIR),
-    collection_name=COLLECTION_NAME,
-)
-
-if vector_store._collection.count() == 0:
-    raise RuntimeError(
-        "No transcript chunks found. Run ingest_transcript.py first."
-    )
-
-llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash-lite")
+load_dotenv(BASE_DIR.parent / ".env")
 
 prompt = PromptTemplate(
     template="""
@@ -67,7 +50,16 @@ def format_docs(retrieved_docs):
     )
 
 
-answer_chain = prompt | llm | StrOutputParser()
+def get_vector_store():
+    if not os.getenv("GEMINI_API_KEY"):
+        raise ValueError("GEMINI_API_KEY is missing from your .env file")
+
+    embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
+    return Chroma(
+        embedding_function=embeddings,
+        persist_directory=str(DATABASE_DIR),
+        collection_name=COLLECTION_NAME,
+    )
 
 
 def print_retrieved_docs(retrieved_docs):
@@ -81,7 +73,7 @@ def print_retrieved_docs(retrieved_docs):
         print(doc.page_content)
 
 
-def get_available_videos():
+def get_available_videos(vector_store):
     result = vector_store.get(include=["metadatas"])
     videos = {}
 
@@ -117,34 +109,79 @@ def select_video(videos):
     raise ValueError("Choose a listed number or enter one of the listed video IDs.")
 
 
-def main():
-    videos = get_available_videos()
-    selected_video_id = select_video(videos)
+def answer_question(video_id, question):
+    """Answer a question using only transcript chunks for the requested video."""
+    if not video_id or not video_id.strip():
+        raise ValueError("video_id must not be empty")
+    if not question or not question.strip():
+        raise ValueError("question must not be empty")
 
-    question = input("Ask a question about the video: ").strip()
-    if not question:
-        raise ValueError("Please enter a question.")
+    vector_store = get_vector_store()
+    indexed_video = vector_store.get(
+        where={"video_id": video_id},
+        include=["metadatas"],
+    )
+    if not indexed_video["ids"]:
+        raise ValueError(f"Video {video_id} has not been indexed.")
 
     retrieved_docs = vector_store.similarity_search(
         question,
         k=4,
-        filter={"video_id": selected_video_id},
+        filter={"video_id": video_id},
     )
     if not retrieved_docs:
         raise RuntimeError(
-            f"No matching transcript chunks found for video {selected_video_id}."
+            f"No matching transcript chunks found for video {video_id}."
         )
 
-    # print_retrieved_docs(retrieved_docs)
-
+    answer_chain = prompt | ChatGoogleGenerativeAI(
+        model="gemini-3.5-flash-lite"
+    ) | StrOutputParser()
     answer = answer_chain.invoke(
         {
             "context": format_docs(retrieved_docs),
             "question": question,
         }
     )
+
+    citations = []
+    seen_citations = set()
+    for doc in retrieved_docs:
+        source = doc.metadata.get("source")
+        for match in re.finditer(r"\[(\d{2}):(\d{2}):(\d{2})\]", doc.page_content):
+            timestamp = match.group(0)[1:-1]
+            hours = int(match.group(1))
+            minutes = int(match.group(2))
+            seconds = int(match.group(3))
+            total_seconds = hours * 3600 + minutes * 60 + seconds
+            citation_key = (source, total_seconds)
+            if source and citation_key not in seen_citations:
+                seen_citations.add(citation_key)
+                citations.append(
+                    {
+                        "timestamp": timestamp,
+                        "source": source,
+                        "url": f"{source}&t={total_seconds}s",
+                    }
+                )
+
+    return {
+        "video_id": video_id,
+        "answer": answer,
+        "citations": citations,
+    }
+
+
+def main():
+    vector_store = get_vector_store()
+    videos = get_available_videos(vector_store)
+    selected_video_id = select_video(videos)
+    question = input("Ask a question about the video: ").strip()
+    result = answer_question(selected_video_id, question)
     print("\nAnswer:")
-    print(answer)
+    print(result["answer"])
+    for citation in result["citations"]:
+        print(f"{citation['timestamp']}: {citation['url']}")
 
 
 if __name__ == "__main__":

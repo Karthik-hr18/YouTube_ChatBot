@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>YouTube Transcript Chat</title>
+    </head>
+    <body>
+        <main>
+            <h1>YouTube Transcript Chat</h1>
+            <p>Ask a question about an indexed YouTube video.</p>
+
+            <form id="askForm">
+                <label for="videoIdInput">YouTube video ID</label>
+                <input
+                    type="text"
+                    id="videoIdInput"
+                    placeholder="e.g. RE2c_eH0Sq4"
+                    required
+                >
+
+                <label for="searchInput">Question</label>
+                <input
+                    type="text"
+                    id="searchInput"
+                    placeholder="What is this video about?"
+                    required
+                >
+
+                <button type="submit" id="searchButton">Ask</button>
+            </form>
+
+            <section id="results" aria-live="polite"></section>
+        </main>
+        <script src="script.js"></script>
+    </body>
+</html>
