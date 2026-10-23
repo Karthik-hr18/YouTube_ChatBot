@@ -8,28 +8,37 @@ from langchain_google_genai import (
     ChatGoogleGenerativeAI,
     GoogleGenerativeAIEmbeddings,
 )
-from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+
+from RAG_Service.video_utils import extract_video_id
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_DIR = BASE_DIR / "database"
-COLLECTION_NAME = "youtube_transcripts_timestamped"
-
 load_dotenv(BASE_DIR.parent / ".env")
+DATABASE_DIR = Path(
+    os.getenv("RAG_DATABASE_DIR", str(BASE_DIR / "database"))
+).expanduser()
+COLLECTION_NAME = "youtube_transcripts_v2"
+EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.5-flash-lite")
+
+ANSWER_WITH_CITATIONS = (
+    "The retrieved transcript evidence is insufficient to provide a "
+    "reliably cited answer."
+)
 
 prompt = PromptTemplate(
-    template="""
-Answer using only the transcript chunks below.
+    template="""Answer the question using only the transcript chunks below.
 
-Rules:
-- Support every factual claim with a timestamp citation from the chunks.
-- If the chunks don't contain enough evidence, say the transcript does not
-  provide enough information.
-- Do not guess speaker identities or invent timestamps.
-- For questions with multiple parts, answer each part separately and cite its
-  evidence.
-- If the question is ambiguous, say what is unclear.
+Requirements:
+- Cite every factual claim with one or more exact chunk labels such as [S1].
+- Use only labels present in the transcript chunks; never invent a label.
+- If the chunks do not support an answer, say the transcript does not provide
+  enough information.
+- Do not invent speakers, facts, or timestamps.
+- Answer each part of a multi-part question and cite the supporting chunks.
+- If the question is ambiguous, state what is unclear.
 
 Transcript chunks:
 {context}
@@ -42,19 +51,11 @@ Answer:
 )
 
 
-def format_docs(retrieved_docs):
-    return "\n\n--- Retrieved chunk ---\n\n".join(
-        f"Source: {doc.metadata.get('source', 'Unknown source')}\n"
-        f"{doc.page_content}"
-        for doc in retrieved_docs
-    )
-
-
 def get_vector_store():
     if not os.getenv("GEMINI_API_KEY"):
-        raise ValueError("GEMINI_API_KEY is missing from your .env file")
+        raise ValueError("GEMINI_API_KEY is missing from the project .env file")
 
-    embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
+    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
     return Chroma(
         embedding_function=embeddings,
         persist_directory=str(DATABASE_DIR),
@@ -62,64 +63,78 @@ def get_vector_store():
     )
 
 
-def print_retrieved_docs(retrieved_docs):
+def format_docs(retrieved_docs):
+    formatted_chunks = []
     for index, doc in enumerate(retrieved_docs, start=1):
-        timestamps = re.findall(r"\[(\d{2}:\d{2}:\d{2})\]", doc.page_content)
-        print(f"\n--- Retrieved chunk {index} ---")
-        print(f"Video ID: {doc.metadata.get('video_id', 'Unknown')}")
-        print(f"Source: {doc.metadata.get('source', 'Unknown')}")
-        print(f"Timestamps: {', '.join(timestamps) if timestamps else 'None found'}")
-        print("Text:")
-        print(doc.page_content)
+        start = doc.metadata.get("timestamp_start", "unknown")
+        end = doc.metadata.get("timestamp_end", start)
+        formatted_chunks.append(
+            f"[S{index}] Source: {doc.metadata.get('source', 'Unknown source')}\n"
+            f"Timestamp range: {start} - {end}\n"
+            f"{doc.page_content}"
+        )
+    return "\n\n--- Retrieved chunk boundary ---\n\n".join(formatted_chunks)
 
 
-def get_available_videos(vector_store):
-    result = vector_store.get(include=["metadatas"])
-    videos = {}
+def attach_validated_citations(answer, retrieved_docs):
+    """Replace valid source labels with timestamps and return matching links."""
+    labels = {
+        f"S{index}": doc.metadata
+        for index, doc in enumerate(retrieved_docs, start=1)
+    }
+    citation_tokens = re.findall(r"\[S[^\]]*\]", answer)
+    cited_labels = [token[1:-1] for token in citation_tokens]
+    if (
+        not cited_labels
+        or any(label not in labels for label in cited_labels)
+        or re.search(r"\[\d{2}:\d{2}:\d{2}\]", answer)
+    ):
+        return ANSWER_WITH_CITATIONS, []
 
-    for metadata in result["metadatas"] or []:
-        video_id = metadata.get("video_id")
-        if video_id:
-            videos[video_id] = metadata.get(
-                "source",
-                f"https://www.youtube.com/watch?v={video_id}",
-            )
+    citations = []
+    seen_labels = set()
+    for label in cited_labels:
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        metadata = labels[label]
+        source = metadata.get("source")
+        timestamp_start = metadata.get("timestamp_start")
+        timestamp_end = metadata.get("timestamp_end", timestamp_start)
+        start_seconds = metadata.get("timestamp_start_seconds")
+        if not source or not timestamp_start or start_seconds is None:
+            return ANSWER_WITH_CITATIONS, []
+        citations.append(
+            {
+                "timestamp": timestamp_start,
+                "timestamp_end": timestamp_end,
+                "source": source,
+                "url": f"{source}&t={int(start_seconds)}s",
+            }
+        )
 
-    return sorted(videos.items())
-
-
-def select_video(videos):
-    if not videos:
-        raise RuntimeError("No indexed videos with video_id metadata were found.")
-
-    print("Choose which video to ask about:")
-    for index, (video_id, source) in enumerate(videos, start=1):
-        print(f"{index}. {video_id} — {source}")
-
-    selection = input("Enter a number or video ID: ").strip()
-    if selection.isdigit():
-        index = int(selection) - 1
-        if 0 <= index < len(videos):
-            return videos[index][0]
-
-    for video_id, _ in videos:
-        if selection == video_id:
-            return video_id
-
-    raise ValueError("Choose a listed number or enter one of the listed video IDs.")
+    rendered_answer = re.sub(
+        r"\[(S\d+)\]",
+        lambda match: f"[{labels[match.group(1)]['timestamp_start']}]",
+        answer,
+    )
+    return rendered_answer, citations
 
 
 def answer_question(video_id, question):
-    """Answer a question using only transcript chunks for the requested video."""
+    """Answer a question using only indexed transcript chunks for this video."""
     if not video_id or not video_id.strip():
         raise ValueError("video_id must not be empty")
     if not question or not question.strip():
         raise ValueError("question must not be empty")
 
+    video_id = extract_video_id(video_id)
+    question = question.strip()
     vector_store = get_vector_store()
     indexed_video = vector_store.get(
         where={"video_id": video_id},
         include=["metadatas"],
+        limit=1,
     )
     if not indexed_video["ids"]:
         raise ValueError(f"Video {video_id} has not been indexed.")
@@ -130,40 +145,20 @@ def answer_question(video_id, question):
         filter={"video_id": video_id},
     )
     if not retrieved_docs:
-        raise RuntimeError(
-            f"No matching transcript chunks found for video {video_id}."
-        )
+        return {
+            "video_id": video_id,
+            "answer": ANSWER_WITH_CITATIONS,
+            "citations": [],
+        }
 
-    answer_chain = prompt | ChatGoogleGenerativeAI(
-        model="gemini-3.5-flash-lite"
-    ) | StrOutputParser()
-    answer = answer_chain.invoke(
+    answer_chain = prompt | ChatGoogleGenerativeAI(model=CHAT_MODEL) | StrOutputParser()
+    raw_answer = answer_chain.invoke(
         {
             "context": format_docs(retrieved_docs),
             "question": question,
         }
     )
-
-    citations = []
-    seen_citations = set()
-    for doc in retrieved_docs:
-        source = doc.metadata.get("source")
-        for match in re.finditer(r"\[(\d{2}):(\d{2}):(\d{2})\]", doc.page_content):
-            timestamp = match.group(0)[1:-1]
-            hours = int(match.group(1))
-            minutes = int(match.group(2))
-            seconds = int(match.group(3))
-            total_seconds = hours * 3600 + minutes * 60 + seconds
-            citation_key = (source, total_seconds)
-            if source and citation_key not in seen_citations:
-                seen_citations.add(citation_key)
-                citations.append(
-                    {
-                        "timestamp": timestamp,
-                        "source": source,
-                        "url": f"{source}&t={total_seconds}s",
-                    }
-                )
+    answer, citations = attach_validated_citations(raw_answer, retrieved_docs)
 
     return {
         "video_id": video_id,
@@ -173,11 +168,9 @@ def answer_question(video_id, question):
 
 
 def main():
-    vector_store = get_vector_store()
-    videos = get_available_videos(vector_store)
-    selected_video_id = select_video(videos)
+    video_id = input("YouTube video URL or ID: ").strip()
     question = input("Ask a question about the video: ").strip()
-    result = answer_question(selected_video_id, question)
+    result = answer_question(video_id, question)
     print("\nAnswer:")
     print(result["answer"])
     for citation in result["citations"]:

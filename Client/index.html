@@ -3,35 +3,82 @@
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>YouTube Transcript Chat</title>
+        <meta
+            name="description"
+            content="Ask questions about YouTube videos and explore timestamped transcript sources."
+        >
+        <title>Video Notes — YouTube Transcript Chat</title>
+        <link rel="stylesheet" href="style.css">
     </head>
     <body>
-        <main>
-            <h1>YouTube Transcript Chat</h1>
-            <p>Ask a question about an indexed YouTube video.</p>
+        <header class="site-header">
+            <a class="brand" href="#" aria-label="Video Notes home">
+                <span class="brand-mark" aria-hidden="true">▶</span>
+                <span>Video Notes</span>
+            </a>
+            <span class="header-caption">Ask. Understand. Jump to the source.</span>
+        </header>
 
-            <form id="askForm">
-                <label for="videoIdInput">YouTube video ID</label>
-                <input
-                    type="text"
-                    id="videoIdInput"
-                    placeholder="e.g. RE2c_eH0Sq4"
-                    required
-                >
+        <main class="page-shell">
+            <section class="intro">
+                <p class="eyebrow">YOUTUBE TRANSCRIPT ASSISTANT</p>
+                <h1>Get to the point<br><span>of any video.</span></h1>
+                <p class="intro-copy">
+                    Add a YouTube link, ask a question, and get an answer grounded
+                    in the transcript—with timestamps you can open.
+                </p>
+            </section>
 
-                <label for="searchInput">Question</label>
-                <input
-                    type="text"
-                    id="searchInput"
-                    placeholder="What is this video about?"
-                    required
-                >
+            <section class="chat-card" aria-labelledby="formHeading">
+                <div class="card-heading">
+                    <div>
+                        <p class="eyebrow">YOUR VIDEO</p>
+                        <h2 id="formHeading">What would you like to know?</h2>
+                    </div>
+                    <span class="status-dot" aria-label="Ready"></span>
+                </div>
 
-                <button type="submit" id="searchButton">Ask</button>
-            </form>
+                <form id="askForm">
+                    <label for="videoUrlInput">YouTube video link or ID</label>
+                    <input
+                        type="text"
+                        id="videoUrlInput"
+                        name="video_url"
+                        placeholder="https://www.youtube.com/watch?v=…"
+                        autocomplete="url"
+                        required
+                    >
 
-            <section id="results" aria-live="polite"></section>
+                    <label for="questionInput">Your question</label>
+                    <textarea
+                        id="questionInput"
+                        name="question"
+                        placeholder="What is this video about?"
+                        rows="3"
+                        maxlength="2000"
+                        required
+                    ></textarea>
+
+                    <label class="refresh-option" for="refreshInput">
+                        <input type="checkbox" id="refreshInput" name="refresh">
+                        Refresh the saved transcript before answering
+                    </label>
+
+                    <button type="submit" id="searchButton">
+                        <span>Ask about this video</span>
+                        <span aria-hidden="true">→</span>
+                    </button>
+                </form>
+
+                <section id="results" class="results" aria-live="polite" aria-busy="false"></section>
+            </section>
+
+            <p class="privacy-note">
+                Answers are based on transcript captions. Select a timestamp to
+                open that part of the video.
+            </p>
         </main>
+        <script src="config.js"></script>
         <script src="script.js"></script>
     </body>
 </html>
