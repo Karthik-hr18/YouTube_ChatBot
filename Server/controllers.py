@@ -1,22 +1,24 @@
+import asyncio
 import logging
-import time
-from threading import Lock
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
 from RAG_Service.ingest_transcript import ingest_video
 from RAG_Service.lang_chain import answer_question
 from RAG_Service.video_utils import extract_video_id
+from Server.job_store import (
+    claim_next_job,
+    complete_job,
+    enqueue_job,
+    fail_job,
+    get_job,
+)
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-jobs = {}
-jobs_lock = Lock()
-JOB_TTL_SECONDS = 30 * 60
-MAX_JOBS = 500
 
 
 class AskRequest(BaseModel):
@@ -34,75 +36,35 @@ def handle_question(video_id: str, question: str, refresh: bool = False) -> dict
     return answer_question(video_id, question)
 
 
-def run_question_job(job_id: str, video_id: str, question: str, refresh: bool):
-    with jobs_lock:
-        jobs[job_id]["status"] = "processing"
-
+def run_question_job(job):
+    job_id = job["job_id"]
     try:
-        result = handle_question(video_id, question, refresh)
-        with jobs_lock:
-            jobs[job_id].update(
-                {
-                    "status": "completed",
-                    "result": result,
-                }
-            )
+        result = handle_question(
+            job["video_id"],
+            job["question"],
+            job["refresh"],
+        )
+        complete_job(job_id, result)
     except ValueError as error:
-        with jobs_lock:
-            jobs[job_id].update(
-                {
-                    "status": "failed",
-                    "error": str(error),
-                    "error_status": 400,
-                }
-            )
+        fail_job(job_id, str(error), 400)
     except RuntimeError as error:
-        with jobs_lock:
-            jobs[job_id].update(
-                {
-                    "status": "failed",
-                    "error": str(error),
-                    "error_status": 502,
-                }
-            )
+        fail_job(job_id, str(error), 502)
     except Exception:
         logger.exception("Unexpected error while processing job %s", job_id)
-        with jobs_lock:
-            jobs[job_id].update(
-                {
-                    "status": "failed",
-                    "error": "An unexpected server error occurred.",
-                    "error_status": 500,
-                }
-            )
+        fail_job(job_id, "An unexpected server error occurred.", 500)
 
 
-def prune_jobs():
-    cutoff = time.monotonic() - JOB_TTL_SECONDS
-    expired = [
-        job_id
-        for job_id, job in jobs.items()
-        if job["created_at"] < cutoff
-        and job["status"] in {"completed", "failed"}
-    ]
-    for job_id in expired:
-        del jobs[job_id]
-
-    if len(jobs) > MAX_JOBS:
-        terminal_jobs = sorted(
-            (
-                job_id
-                for job_id, job in jobs.items()
-                if job["status"] in {"completed", "failed"}
-            ),
-            key=lambda job_id: jobs[job_id]["created_at"],
-        )
-        for job_id in terminal_jobs[: max(0, len(jobs) - MAX_JOBS)]:
-            del jobs[job_id]
+async def job_worker():
+    while True:
+        job = await asyncio.to_thread(claim_next_job)
+        if job is None:
+            await asyncio.sleep(1)
+            continue
+        await asyncio.to_thread(run_question_job, job)
 
 
 @router.post("/ask", status_code=status.HTTP_202_ACCEPTED)
-def ask(request: AskRequest, background_tasks: BackgroundTasks):
+def ask(request: AskRequest):
     video_url = request.video_url.strip()
     question = request.question.strip()
     if not video_url:
@@ -116,20 +78,7 @@ def ask(request: AskRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail=str(error)) from error
 
     job_id = str(uuid4())
-    with jobs_lock:
-        prune_jobs()
-        jobs[job_id] = {
-            "status": "queued",
-            "created_at": time.monotonic(),
-        }
-
-    background_tasks.add_task(
-        run_question_job,
-        job_id,
-        video_id,
-        question,
-        request.refresh,
-    )
+    enqueue_job(job_id, video_id, question, request.refresh)
     return {
         "job_id": job_id,
         "status": "queued",
@@ -139,18 +88,10 @@ def ask(request: AskRequest, background_tasks: BackgroundTasks):
 
 @router.get("/ask/{job_id}")
 def get_job_status(job_id: str):
-    with jobs_lock:
-        prune_jobs()
-        job = jobs.get(job_id)
-        if job is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Job not found or expired.",
-            )
-        response = {"job_id": job_id, "status": job["status"]}
-        if job["status"] == "completed":
-            response["result"] = job["result"]
-        elif job["status"] == "failed":
-            response["error"] = job["error"]
-            response["error_status"] = job["error_status"]
-        return response
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found or expired.",
+        )
+    return job

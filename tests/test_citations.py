@@ -30,7 +30,11 @@ class CitationTests(unittest.TestCase):
         self.assertEqual(citations[0]["url"], "https://www.youtube.com/watch?v=RE2c_eH0Sq4&t=4s")
 
     def test_unknown_or_missing_references_are_rejected(self):
-        for answer_text in ("Unsupported claim [S2].", "Uncited factual claim."):
+        for answer_text in (
+            "Unsupported claim [S2].",
+            "Uncited factual claim.",
+            "Supported first claim [S1]. Unsupported second claim.",
+        ):
             with self.subTest(answer=answer_text):
                 answer, citations = attach_validated_citations(
                     answer_text,

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
 from langchain_google_genai import (
     ChatGoogleGenerativeAI,
     GoogleGenerativeAIEmbeddings,
@@ -76,6 +77,75 @@ def format_docs(retrieved_docs):
     return "\n\n--- Retrieved chunk boundary ---\n\n".join(formatted_chunks)
 
 
+def split_independent_questions(question):
+    """Split explicit questions and clear coordinated question clauses."""
+    question = question.strip()
+    if not question:
+        return []
+
+    parts = re.split(r"\?\s*(?=\S)|[\r\n]+|;\s*", question)
+    questions = []
+    question_starters = (
+        r"who|what|when|where|why|how|which|whose|whom|"
+        r"can|could|did|do|does|is|are|was|were|will|would|"
+        r"has|have|had|should"
+    )
+    for part in parts:
+        part = part.strip(" \t-•?0123456789.)")
+        part = re.sub(r"^(?:and|also)\s+", "", part, flags=re.IGNORECASE)
+        if not part:
+            continue
+        coordinated = re.split(
+            rf"\s+(?:and|also)\s+(?=(?:{question_starters})\b)",
+            part,
+            flags=re.IGNORECASE,
+        )
+        questions.extend(piece.strip() for piece in coordinated if piece.strip())
+
+    return questions or [question]
+
+
+def is_broad_question(question):
+    normalized = question.lower()
+    broad_phrases = (
+        "what is this video about",
+        "what's this video about",
+        "what is the video about",
+        "summarize this video",
+        "summary of this video",
+        "give me an overview",
+        "main topic",
+        "overall message",
+        "main idea",
+    )
+    return any(phrase in normalized for phrase in broad_phrases)
+
+
+def get_video_overview_docs(vector_store, video_id, limit=8):
+    """Choose chunks spread across the transcript for video-level questions."""
+    stored = vector_store.get(
+        where={"video_id": video_id},
+        include=["documents", "metadatas"],
+    )
+    documents = stored.get("documents") or []
+    metadatas = stored.get("metadatas") or []
+    chunks = [
+        Document(page_content=text, metadata=metadata or {})
+        for text, metadata in zip(documents, metadatas)
+        if text
+    ]
+    chunks.sort(key=lambda doc: doc.metadata.get("chunk_index", 0))
+    if len(chunks) <= limit:
+        return chunks
+
+    last_index = len(chunks) - 1
+    selected_indices = {
+        round(index * last_index / (limit - 1))
+        for index in range(limit)
+    } if limit > 1 else {last_index // 2}
+    return [chunks[index] for index in sorted(selected_indices)]
+
+
 def attach_validated_citations(answer, retrieved_docs):
     """Replace valid source labels with timestamps and return matching links."""
     labels = {
@@ -90,6 +160,16 @@ def attach_validated_citations(answer, retrieved_docs):
         or re.search(r"\[\d{2}:\d{2}:\d{2}\]", answer)
     ):
         return ANSWER_WITH_CITATIONS, []
+
+    sentences = [
+        sentence.strip(" \t-*0123456789.)")
+        for sentence in re.split(r"(?<=[.!?])\s+|\r?\n+", answer)
+    ]
+    for sentence in sentences:
+        if not sentence or sentence.endswith(":"):
+            continue
+        if not re.search(r"\[S\d+\]", sentence):
+            return ANSWER_WITH_CITATIONS, []
 
     citations = []
     seen_labels = set()
@@ -122,7 +202,7 @@ def attach_validated_citations(answer, retrieved_docs):
 
 
 def answer_question(video_id, question):
-    """Answer a question using only indexed transcript chunks for this video."""
+    """Answer one or more questions using evidence from a single video."""
     if not video_id or not video_id.strip():
         raise ValueError("video_id must not be empty")
     if not question or not question.strip():
@@ -139,31 +219,59 @@ def answer_question(video_id, question):
     if not indexed_video["ids"]:
         raise ValueError(f"Video {video_id} has not been indexed.")
 
-    retrieved_docs = vector_store.similarity_search(
-        question,
-        k=4,
-        filter={"video_id": video_id},
-    )
-    if not retrieved_docs:
-        return {
-            "video_id": video_id,
-            "answer": ANSWER_WITH_CITATIONS,
-            "citations": [],
-        }
-
     answer_chain = prompt | ChatGoogleGenerativeAI(model=CHAT_MODEL) | StrOutputParser()
-    raw_answer = answer_chain.invoke(
-        {
-            "context": format_docs(retrieved_docs),
-            "question": question,
-        }
+    question_answers = []
+    all_citations = []
+    seen_citations = set()
+
+    for subquestion in split_independent_questions(question):
+        if is_broad_question(subquestion):
+            retrieved_docs = get_video_overview_docs(vector_store, video_id)
+        else:
+            retrieved_docs = vector_store.similarity_search(
+                subquestion,
+                k=4,
+                filter={"video_id": video_id},
+            )
+
+        if not retrieved_docs:
+            answer = ANSWER_WITH_CITATIONS
+            citations = []
+        else:
+            raw_answer = answer_chain.invoke(
+                {
+                    "context": format_docs(retrieved_docs),
+                    "question": subquestion,
+                }
+            )
+            answer, citations = attach_validated_citations(
+                raw_answer,
+                retrieved_docs,
+            )
+
+        question_answers.append(
+            {
+                "question": subquestion,
+                "answer": answer,
+                "citations": citations,
+            }
+        )
+        for citation in citations:
+            key = citation["url"]
+            if key not in seen_citations:
+                seen_citations.add(key)
+                all_citations.append(citation)
+
+    rendered_answers = "\n\n".join(
+        f"{index}. {item['question']}\n{item['answer']}"
+        for index, item in enumerate(question_answers, start=1)
     )
-    answer, citations = attach_validated_citations(raw_answer, retrieved_docs)
 
     return {
         "video_id": video_id,
-        "answer": answer,
-        "citations": citations,
+        "answer": rendered_answers,
+        "answers": question_answers,
+        "citations": all_citations,
     }
 
 

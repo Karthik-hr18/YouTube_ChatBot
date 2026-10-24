@@ -1,0 +1,7 @@
+[
+  {
+    "video_id": "REPLACE_WITH_AN_INDEXED_VIDEO_ID",
+    "question": "REPLACE_WITH_A_QUESTION_WHOSE_ANSWER_IS_IN_THE_VIDEO",
+    "expected_timestamps": ["00:00:00"]
+  }
+]
